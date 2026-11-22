@@ -36,6 +36,7 @@ module ddr3_phy_slow #(
     parameter DW    = 3,                // read delay bits per lane
     parameter ELVDS = 0,                // Gowin ELVDS_OBUF/ELVDS_IOBUF for CK and DQS
     parameter IOBFF = 0,                // without ELVDS: CK, DQS from Gowin OBUF/IOBUF with IO block registers
+    parameter IDDR  = 0,                // DQ read through Gowin IDDR in the IO blocks, see the read capture
     localparam LANES = DQ_W / 8,
     localparam STEPS = 2 ** DW
 ) (
@@ -236,7 +237,6 @@ for (genvar l = 0; l < LANES; l++) begin : g_dqs
         assign ddr_dqs_n[l] = dqs_oe ? ~dqs_q : 1'bz;
     end
 end
-assign ddr_dq    = dq_oe ? dq_q : 'z;
 assign ddr_dm    = dm_q;
 
 // Read capture. Samples are numbered in half clk cycles h after the ce edge
@@ -245,20 +245,39 @@ assign ddr_dm    = dm_q;
 // the (CL-1)-th edge, not the CL-th (JESD79-3F 5.4), and tDQSCK (1-10ns) may be
 // longer than tCK. Beat j of a lane is sampled at h = H0 + delay + 2*j, so the
 // delays cover CL-1 up to CL plus a bit.
-reg [DQ_W-1:0] dq_p, dq_n;
-initial begin
-    dq_p = '0;
-    dq_n = '0;
+// The samples come from registers in the fabric, or with IDDR from the IDDR
+// in each DQ pin's IO block: the fabric registers sit wherever the placer puts
+// them, so the delay from the pin and with it the sample time differs from
+// build to build and from pin to pin (on a Tang Mega 138K Pro one DQ pin read
+// the previous beat now and then). An IDDR gives its samples R_LAT clk cycles
+// later than the fabric registers.
+localparam integer R_LAT = IDDR ? 2 : 0;
+wire [DQ_W-1:0] dq_p, dq_n;     // DQ at the last rising / falling clk edge, R_LAT cycles before
+if (IDDR) begin : g_dq_iddr
+    for (genvar i = 0; i < DQ_W; i++) begin : g_bit
+        wire o;
+        IOBUF buf_dq(.I(dq_q[i]), .OEN(!dq_oe), .O(o), .IO(ddr_dq[i]));
+        IDDR iddr(.D(o), .CLK(clk), .Q0(dq_p[i]), .Q1(dq_n[i]));
+    end
+end else begin : g_dq
+    reg [DQ_W-1:0] p, n;
+    initial begin
+        p = '0;
+        n = '0;
+    end
+    always @(posedge clk) p <= ddr_dq;
+    always @(negedge clk) n <= ddr_dq;
+    assign dq_p = p;
+    assign dq_n = n;
+    assign ddr_dq = dq_oe ? dq_q : 'z;
 end
-always @(posedge clk) dq_p <= ddr_dq;
-always @(negedge clk) dq_n <= ddr_dq;
 
 localparam integer H0 = 4 * (CL - 1) - 2;
-localparam integer U_END = (H0 + STEPS - 1 + 14) / 2 + 2;    // all samples are in
+localparam integer U_END = (H0 + STEPS - 1 + 14) / 2 + 2 + R_LAT;    // all samples are in
 localparam UW = $clog2(U_END + 2);
 
 reg           r_act;
-reg [UW-1:0]  ru;               // clk edges since the start; samples 2u-2 and 2u-1 are ready
+reg [UW-1:0]  ru;               // clk edges since the start; samples 2(u-R_LAT)-2 and -1 are ready
 reg [8*DQ_W-1:0] r_data;
 initial begin
     r_act = 0;
@@ -277,9 +296,9 @@ always @(posedge clk) begin
         ru <= ru + 1'd1;
         for (int l = 0; l < LANES; l++)
             for (int j = 0; j < 8; j++) begin
-                if (32'(ru) * 2 - 2 == 32'(H0) + 32'(phy_rd_delay[DW*l +: DW]) + 2 * j)
+                if (32'(ru) * 2 - 2 - 2 * R_LAT == 32'(H0) + 32'(phy_rd_delay[DW*l +: DW]) + 2 * j)
                     r_data[DQ_W*j + 8*l +: 8] <= dq_p[8*l +: 8];
-                if (32'(ru) * 2 - 1 == 32'(H0) + 32'(phy_rd_delay[DW*l +: DW]) + 2 * j)
+                if (32'(ru) * 2 - 1 - 2 * R_LAT == 32'(H0) + 32'(phy_rd_delay[DW*l +: DW]) + 2 * j)
                     r_data[DQ_W*j + 8*l +: 8] <= dq_n[8*l +: 8];
             end
         if (ru == UW'(U_END)) begin
